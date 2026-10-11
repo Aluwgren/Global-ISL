@@ -1,0 +1,25 @@
+# Generated Windows binaries, import libraries, packages, and analysis output
+/build/
+/build-*/
+/dist/
+*.obj
+*.o
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.plist
+*.zip
+
+# Local configuration, logs, and editor state
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+__pycache__/
+*.pyc

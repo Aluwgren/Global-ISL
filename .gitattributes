@@ -1,0 +1,11 @@
+# Preserve imported source/configuration bytes; normalize new tooling/docs.
+*.cpp -text
+*.ini -text
+*.def -text
+*.md text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+LICENSE text eol=lf
+# The archived Markdown uses two trailing spaces for explicit line breaks.
+docs/history/*.md whitespace=-blank-at-eol
