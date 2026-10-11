@@ -1,4 +1,4 @@
-// Global Point Light ISL 1.5-test22
+// Global Point Light ISL 1.5-test22.1
 // Skyrim SE 1.5.97 / SKSE 2.0.20 / Community Shaders and Open Shaders
 // Standalone raw SKSE plugin. No CRT, CommonLib, ESP, Papyrus, or Address Library.
 //
@@ -687,7 +687,7 @@ static void write_log_line(const char* text, bool force)
         return;
     }
     if (creatingFailureOnlyLog) {
-        write_raw_log_line("=== Global Point Light ISL 1.5-test22 ===");
+        write_raw_log_line("=== Global Point Light ISL 1.5-test22.1 ===");
         write_raw_log_line("Normal logging is disabled; this log was created because startup failed.");
     }
     write_raw_log_line(text);
@@ -1268,6 +1268,7 @@ struct ActiveDynamicCreationContext
     volatile u32 threadId = 0u;
     u32 depth = 0u;
     u64 streamKeys[4]{};
+    u32 generations[4]{};
 };
 
 static constexpr u32 kContinuousInstanceCapacity = 256u;
@@ -1277,6 +1278,9 @@ static ContinuousLightInstance g_continuousInstances[kContinuousInstanceCapacity
 static ContinuousLightStream g_continuousStreams[kContinuousStreamCapacity]{};
 static ActiveDynamicCreationContext g_activeDynamicContexts[kActiveDynamicContextCapacity]{};
 static volatile u32 g_continuousStateLock = 0u;
+static u32 g_continuousStateGeneration = 0u; // Protected by g_continuousStateLock.
+static volatile u32 g_untrackedDynamicCreations = 0u;
+static volatile u32 g_continuousInstancesDirty = 0u;
 
 static bool try_lock_continuous_state()
 {
@@ -1288,6 +1292,20 @@ static bool try_lock_continuous_state()
 static void unlock_continuous_state()
 {
     __atomic_store_n(&g_continuousStateLock, 0u, __ATOMIC_RELEASE);
+}
+
+static void refresh_continuous_generation()
+{
+    // Called only with the existing state lock held. No scene pointers are
+    // followed, and this small cache reset occurs only after a load/new game.
+    const u32 generation = __atomic_load_n(&g_sceneGeneration, __ATOMIC_ACQUIRE);
+    if (__atomic_exchange_n(&g_continuousInstancesDirty, 0u, __ATOMIC_ACQ_REL) != 0u) {
+        memset(g_continuousInstances, 0, sizeof(g_continuousInstances));
+    }
+    if (g_continuousStateGeneration == generation) return;
+    memset(g_continuousInstances, 0, sizeof(g_continuousInstances));
+    memset(g_continuousStreams, 0, sizeof(g_continuousStreams));
+    g_continuousStateGeneration = generation;
 }
 
 static u32 hash_u64_to_u32(u64 value)
@@ -1343,7 +1361,7 @@ static ContinuousLightStream* find_continuous_stream(u64 key)
 
 static void remember_continuous_instance(uptr niLight, u64 streamKey, u64 now)
 {
-    if (niLight == 0u || streamKey == 0u) return;
+    if (niLight == 0u) return;
     const u32 start = hash_u64_to_u32(static_cast<u64>(niLight)) & (kContinuousInstanceCapacity - 1u);
     ContinuousLightInstance* oldest = nullptr;
     for (u32 probe = 0u; probe < 8u; ++probe) {
@@ -1381,6 +1399,7 @@ static u64 note_dynamic_stream_event(u32 baseFormID, u32 ownerFormID)
 {
     if (!g_continuousShadowLimiterEnabled || baseFormID == 0u) return 0u;
     if (!try_lock_continuous_state()) return 0u;
+    refresh_continuous_generation();
 
     const u64 now = current_tick_ms();
     const u64 streamKey = (static_cast<u64>(ownerFormID) << 32u) | static_cast<u64>(baseFormID);
@@ -1404,17 +1423,27 @@ static u64 note_dynamic_stream_event(u32 baseFormID, u32 ownerFormID)
     return stream ? streamKey : 0u;
 }
 
-static void remember_dynamic_light_instance(void* niLight, u64 streamKey)
+static void remember_dynamic_light_instance(void* niLight, u64 streamKey, u32 generation)
 {
-    if (!g_continuousShadowLimiterEnabled || !niLight || streamKey == 0u) return;
-    if (!try_lock_continuous_state()) return;
-    remember_continuous_instance(reinterpret_cast<uptr>(niLight), streamKey, current_tick_ms());
+    if (!g_continuousShadowLimiterEnabled || !niLight) return;
+    if (!try_lock_continuous_state()) {
+        // A missed pointer-reuse invalidation must not leave an old spray tag
+        // active. The next lock holder can discard the tiny instance cache.
+        __atomic_store_n(&g_continuousInstancesDirty, 1u, __ATOMIC_RELEASE);
+        return;
+    }
+    refresh_continuous_generation();
+    if (generation == g_continuousStateGeneration) {
+        // Zero explicitly invalidates a previous spray association when the
+        // allocator reuses the NiLight address for an ordinary/static light.
+        remember_continuous_instance(reinterpret_cast<uptr>(niLight), streamKey, current_tick_ms());
+    }
     unlock_continuous_state();
 }
 
 static ActiveDynamicCreationContext* push_active_dynamic_context(u64 streamKey)
 {
-    if (streamKey == 0u) return nullptr;
+    if (!g_continuousShadowLimiterEnabled) return nullptr;
     const u32 tid = GetCurrentThreadId();
     if (tid == 0u) return nullptr;
 
@@ -1434,8 +1463,13 @@ static ActiveDynamicCreationContext* push_active_dynamic_context(u64 streamKey)
                 }
             }
 
-            if (ctx.depth >= 4u) return nullptr;
-            ctx.streamKeys[ctx.depth++] = streamKey;
+            if (ctx.depth < 4u) {
+                ctx.streamKeys[ctx.depth] = streamKey;
+                ctx.generations[ctx.depth] = __atomic_load_n(&g_sceneGeneration, __ATOMIC_ACQUIRE);
+            }
+            // Overflow frames remain represented by depth so a deeply nested
+            // unclassified creation cannot inherit an outer spray's key.
+            ++ctx.depth;
             __atomic_thread_fence(__ATOMIC_RELEASE);
             return &ctx;
         }
@@ -1448,35 +1482,45 @@ static void pop_active_dynamic_context(ActiveDynamicCreationContext* ctx)
     if (!ctx) return;
     const u32 tid = GetCurrentThreadId();
     if (__atomic_load_n(&ctx->threadId, __ATOMIC_ACQUIRE) != tid || ctx->depth == 0u) return;
-    ctx->streamKeys[--ctx->depth] = 0u;
+    --ctx->depth;
+    if (ctx->depth < 4u) {
+        ctx->streamKeys[ctx->depth] = 0u;
+        ctx->generations[ctx->depth] = 0u;
+    }
     if (ctx->depth == 0u) {
         __atomic_store_n(&ctx->threadId, 0u, __ATOMIC_RELEASE);
     }
 }
 
-static u64 active_dynamic_stream_key_for_current_thread()
+static bool active_dynamic_stream_key_for_current_thread(u64& streamKey)
 {
+    streamKey = 0u;
     const u32 tid = GetCurrentThreadId();
-    if (tid == 0u) return 0u;
+    if (tid == 0u) return false;
     for (u32 i = 0u; i < kActiveDynamicContextCapacity; ++i) {
         auto& ctx = g_activeDynamicContexts[i];
         if (__atomic_load_n(&ctx.threadId, __ATOMIC_ACQUIRE) != tid) continue;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        if (ctx.depth == 0u || ctx.depth > 4u) return 0u;
-        return ctx.streamKeys[ctx.depth - 1u];
+        if (ctx.depth != 0u && ctx.depth <= 4u &&
+            ctx.generations[ctx.depth - 1u] == __atomic_load_n(&g_sceneGeneration, __ATOMIC_ACQUIRE)) {
+            streamKey = ctx.streamKeys[ctx.depth - 1u];
+        }
+        return true; // A zero key still masks stale cache entries/outer contexts.
     }
-    return 0u;
+    return false;
 }
 
 static bool should_skip_continuous_shadow_promotion(const void* niLight)
 {
     if (!g_continuousShadowLimiterEnabled || !niLight || processing_suspended()) return false;
+    if (__atomic_load_n(&g_untrackedDynamicCreations, __ATOMIC_ACQUIRE) != 0u) return false;
     if (!try_lock_continuous_state()) return false;
+    refresh_continuous_generation();
 
     const u64 now = current_tick_ms();
     bool skip = false;
-    u64 streamKey = active_dynamic_stream_key_for_current_thread();
-    if (streamKey == 0u) {
+    u64 streamKey = 0u;
+    if (!active_dynamic_stream_key_for_current_thread(streamKey)) {
         const ContinuousLightInstance* instance = find_continuous_instance(reinterpret_cast<uptr>(niLight), now);
         if (instance) streamKey = instance->streamKey;
     }
@@ -2054,10 +2098,9 @@ static u64 make_detached_fire_instance_key(u32 baseFormID, const void* niLight, 
     return key != 0u ? key : 0x4ull;
 }
 
-static void cache_detached_fire_instance(u32 baseFormID, const void* niLight, bool isFire)
+static void cache_detached_fire_instance(u32 baseFormID, const void* niLight, bool isFire, u32 generation)
 {
     if (baseFormID == 0u || !niLight) return;
-    const u32 generation = __atomic_load_n(&g_sceneGeneration, __ATOMIC_ACQUIRE);
     const u64 key = make_detached_fire_instance_key(baseFormID, niLight, generation);
     const u64 desired = key | 0x1ull | (isFire ? 0x2ull : 0ull);
     const u32 start = static_cast<u32>(key ^ (key >> 32u)) &
@@ -2940,7 +2983,7 @@ static bool scan_owner_plugin(const u8* tesFile)
         pos += recordBytes;
     }
 
-    if (detachedState && detachedDefinitionsValid &&
+    if (detachedState && detachedDefinitionsValid && parsedLighGroup && parsedHazdGroup && pos == fileSize &&
         detachedState->sourceBaseCount != 0u && detachedState->localLightCount != 0u) {
         const bool sourcesParsed = scan_detached_reference_top_groups(
             file, fileSize, tes4Size, masterCount, detachedState,
@@ -3157,10 +3200,13 @@ struct PendingLightPolicy
 // Renderer-generated particle lights never receive this TESObjectLIGH tag.
 static PendingLightPolicy g_pendingLightPolicy{};
 
+static void reset_fire_color_batch();
+
 static void clear_pending_after_transition_on_renderer_thread()
 {
     if (__atomic_exchange_n(&g_clearPendingAfterTransition, 0l, __ATOMIC_ACQ_REL) != 0) {
         g_pendingLightPolicy = {};
+        reset_fire_color_batch();
     }
 }
 
@@ -3732,6 +3778,12 @@ static FireColorAnchor g_fireColorAnchors[kMaxFireColorAnchors]{};
 static u32 g_fireColorAnchorCount = 0u;
 static const LightDataVectorRaw* g_fireColorAnchorVector = nullptr;
 
+static void reset_fire_color_batch()
+{
+    g_fireColorAnchorCount = 0u;
+    g_fireColorAnchorVector = nullptr;
+}
+
 static bool safe_light_position(const u8* light, FireColorAnchor& out)
 {
     if (!light) return false;
@@ -4050,6 +4102,7 @@ static void* universal_create_point_light_hook(void* ligh, void* refr, void* roo
 {
     CreatePointLightFn original = g_originalCreatePointLight;
     if (!original) return nullptr;
+    const u32 creationGeneration = __atomic_load_n(&g_sceneGeneration, __ATOMIC_ACQUIRE);
 
     // Exact no-light owners are vetoed at the same CreatePointLight choke point
     // already used by the ISL path. No NiPointLight is created, converted,
@@ -4074,28 +4127,34 @@ static void* universal_create_point_light_hook(void* ligh, void* refr, void* roo
     u32 refFormID = 0u;
     if (!suspended) {
         clear_pending_after_transition_on_renderer_thread();
-        if (g_fireColorEnabled && g_fireColorPairDetachedBulbs && refr) {
-            refFormID = read_u32(static_cast<const u8*>(refr) + kTESFormFormIDOffset);
-            canAssociateDetached =
-                baseFormID != 0u && baseFormID < 0xFF000000u &&
-                refFormID != 0u && refFormID < 0xFF000000u;
-        }
+    }
+    // This is metadata only, like the base-form classification above. A light
+    // created during load may never pass through CreatePointLight again.
+    if (g_fireColorEnabled && g_fireColorPairDetachedBulbs && refr) {
+        refFormID = read_u32(static_cast<const u8*>(refr) + kTESFormFormIDOffset);
+        canAssociateDetached =
+            baseFormID != 0u && baseFormID < 0xFF000000u &&
+            refFormID != 0u && refFormID < 0xFF000000u;
     }
 
     const u32 dynamicOwnerFormID = forceDynamic ? owner_form_id_for_dynamic_light(refr, root) : 0u;
     const u64 dynamicStreamKey = (forceDynamic && baseFormID != 0u)
         ? note_dynamic_stream_event(baseFormID, dynamicOwnerFormID) : 0u;
     ActiveDynamicCreationContext* activeDynamic = push_active_dynamic_context(dynamicStreamKey);
+    const bool untrackedCreation = g_continuousShadowLimiterEnabled && !activeDynamic;
+    if (untrackedCreation) __atomic_add_fetch(&g_untrackedDynamicCreations, 1u, __ATOMIC_ACQ_REL);
     void* created = original(ligh, refr, root, forceDynamic, useLightRadius, affectRequesterOnly);
+    if (untrackedCreation) __atomic_sub_fetch(&g_untrackedDynamicCreations, 1u, __ATOMIC_ACQ_REL);
     pop_active_dynamic_context(activeDynamic);
-    if (created && dynamicStreamKey != 0u) {
+    if (created) {
         // Keep a short-lived pointer->stream association for re-adds that occur
         // after CreatePointLight returns. The in-flight context above covers the
         // common nested AddLight path before the NiLight pointer is returned.
-        remember_dynamic_light_instance(created, dynamicStreamKey);
+        remember_dynamic_light_instance(created, dynamicStreamKey, creationGeneration);
     }
-    if (created && canAssociateDetached) {
-        cache_detached_fire_instance(baseFormID, created, is_detached_fire_ref(refFormID));
+    if (created && baseFormID != 0u && baseFormID < 0xFF000000u) {
+        cache_detached_fire_instance(baseFormID, created,
+            canAssociateDetached && is_detached_fire_ref(refFormID), creationGeneration);
     }
     return created;
 }
@@ -4198,6 +4257,28 @@ static bool write_code_bytes(u8* destination, const u8* bytes, u32 count)
         return bytes_equal(destination, bytes, count);
     }
     return bytes_equal(destination, bytes, count);
+}
+
+static bool restore_code_bytes(u8* destination, const u8* original, u32 count)
+{
+    // A failed patch attempt does not prove that no bytes changed. Conversely,
+    // an untouched site needs no writable-page permission to count as restored.
+    if (bytes_equal(destination, original, count)) return true;
+    write_code_bytes(destination, original, count);
+    return bytes_equal(destination, original, count);
+}
+
+static bool restore_effects11_calls(u8* const* callsites, u32 count, u8* originalTarget)
+{
+    bool allRestored = true;
+    for (u32 i = 0u; i < count; ++i) {
+        u8 originalCall[5] = {};
+        if (!build_rel32_call(originalCall, callsites[i], originalTarget) ||
+            !restore_code_bytes(callsites[i], originalCall, 5u)) {
+            allRestored = false;
+        }
+    }
+    return allRestored;
 }
 
 static bool shadow_gate_register_contract_ok(const u8* gate, const ModuleInfo& info)
@@ -4481,8 +4562,11 @@ static bool install_open_shaders_shadow_add_policy(const ModuleInfo& info)
     write_u32(relayPatch + 1u, static_cast<u32>(relayDisp));
     if (!write_code_bytes(gate + 7u, relayPatch, 6u) ||
         !bytes_equal(gate + 7u, relayPatch, 6u)) {
-        VirtualFree(relayPage, 0u, MEM_RELEASE_);
-        log_line("WARNING: Open Shaders shadow-add policy gate patch failed.");
+        const bool restored = restore_code_bytes(gate + 7u, originalGateBytes, 6u);
+        if (restored) VirtualFree(relayPage, 0u, MEM_RELEASE_);
+        log_line(restored
+            ? "WARNING: Open Shaders shadow-add gate patch failed; original gate restored."
+            : "WARNING: Open Shaders shadow-add gate rollback failed; relay retained to preserve live calls.");
         return false;
     }
 
@@ -4493,12 +4577,14 @@ static bool install_open_shaders_shadow_add_policy(const ModuleInfo& info)
         write_u32(immediate, bits.u);
         if (!write_code_bytes(promotedBiasWrite + 3u, immediate, 4u) ||
             !bytes_equal(promotedBiasWrite + 3u, immediate, 4u)) {
-            // Do not leave a partially-installed configurable bias feature. The
-            // relay can be safely detached by restoring the exact original JZ.
-            write_code_bytes(gate + 7u, originalGateBytes, 6u);
-            VirtualFree(relayPage, 0u, MEM_RELEASE_);
+            // A relay is safe to free only after its last callsite is restored.
+            // If protection prevents rollback, keep the live target allocated.
+            const bool restored = restore_code_bytes(gate + 7u, originalGateBytes, 6u);
+            if (restored) VirtualFree(relayPage, 0u, MEM_RELEASE_);
             g_shadowBiasCorrectionEnabled = false;
-            log_line("WARNING: Open Shaders promoted-depth-bias immediate patch failed; shadow-add policy relay rolled back.");
+            log_line(restored
+                ? "WARNING: Open Shaders promoted-depth-bias patch failed; shadow-add policy relay rolled back."
+                : "WARNING: Open Shaders promoted-depth-bias patch and gate rollback failed; live relay retained with bias correction disabled.");
             return false;
         }
     }
@@ -4693,10 +4779,12 @@ static bool install_universal_point_light_hooks(const ModuleInfo& info)
     if (write_code_bytes(pushTarget, pushPatch, kPushOverwriteSize)) {
         pushPatched = true;
     } else {
-        g_originalPushLight = nullptr;
+        const bool pushRestored = restore_code_bytes(pushTarget, kExpectedPushPrologue, kPushOverwriteSize);
+        if (pushRestored) g_originalPushLight = nullptr;
         g_originalProcessLight = nullptr;
         g_originalCreatePointLight = nullptr;
-        VirtualFree(relayPage, 0u, MEM_RELEASE_);
+        g_originalEffects11OverridePointLightColor = nullptr;
+        if (pushRestored) VirtualFree(relayPage, 0u, MEM_RELEASE_);
         log_error("Renderer LightData push entry patch failed.");
         return false;
     }
@@ -4710,14 +4798,13 @@ static bool install_universal_point_light_hooks(const ModuleInfo& info)
         }
 
         if (!processPatched || !createPatched) {
-            const bool createRestored = !createPatched ||
-                write_code_bytes(createTarget, kExpectedCreatePrologue, kCreatePointLightOverwriteSize);
-            const bool processRestored = !processPatched ||
-                write_code_bytes(processTarget, kExpectedProcessPrologue, kProcessOverwriteSize);
-            const bool pushRestored = write_code_bytes(pushTarget, kExpectedPushPrologue, kPushOverwriteSize);
+            const bool createRestored = restore_code_bytes(createTarget, kExpectedCreatePrologue, kCreatePointLightOverwriteSize);
+            const bool processRestored = restore_code_bytes(processTarget, kExpectedProcessPrologue, kProcessOverwriteSize);
+            const bool pushRestored = restore_code_bytes(pushTarget, kExpectedPushPrologue, kPushOverwriteSize);
             if (createRestored) g_originalCreatePointLight = nullptr;
             if (processRestored) g_originalProcessLight = nullptr;
             if (pushRestored) g_originalPushLight = nullptr;
+            g_originalEffects11OverridePointLightColor = nullptr;
             if (createRestored && processRestored && pushRestored) VirtualFree(relayPage, 0u, MEM_RELEASE_);
             log_error("Runtime EditorID classifier hook transaction failed; installed hooks were rolled back where possible.");
             return false;
@@ -4725,7 +4812,9 @@ static bool install_universal_point_light_hooks(const ModuleInfo& info)
     }
 
     bool effects11Patched = false;
+    bool effects11MayReferenceRelay = false;
     if (effects11AuthoritySupported) {
+        effects11MayReferenceRelay = true;
         u32 patchedCount = 0u;
         for (u32 i = 0u; i < effects11CallsiteCount; ++i) {
             u8 callPatch[5] = {};
@@ -4739,20 +4828,15 @@ static bool install_universal_point_light_hooks(const ModuleInfo& info)
             effects11Patched = true;
             g_effects11AuthorityInstalled = true;
         } else {
-            // Roll back every callsite already redirected. The original target
-            // remains intact because this layer patches only direct CALLs.
-            for (u32 i = 0u; i < patchedCount; ++i) {
-                u8 originalCall[5] = {};
-                originalCall[0] = 0xE8u;
-                i32 originalDisp = 0;
-                if (rel32_displacement(effects11Callsites[i] + 5u, effects11Target, originalDisp)) {
-                    write_u32(originalCall + 1u, static_cast<u32>(originalDisp));
-                    write_code_bytes(effects11Callsites[i], originalCall, 5u);
-                }
-            }
-            g_originalEffects11OverridePointLightColor = nullptr;
+            // Include the failed attempt, not just writes reported successful.
+            // Any surviving hook must still forward to the original Effects11.
+            effects11MayReferenceRelay = !restore_effects11_calls(
+                effects11Callsites, effects11CallsiteCount, effects11Target);
+            if (!effects11MayReferenceRelay) g_originalEffects11OverridePointLightColor = nullptr;
             g_effects11AuthorityInstalled = false;
-            log_line("WARNING: Effects11 authority callsite transaction failed and was rolled back; core ISL hooks remain active.");
+            log_line(effects11MayReferenceRelay
+                ? "WARNING: Effects11 authority rollback incomplete; live relay and original target retained."
+                : "WARNING: Effects11 authority callsite transaction rolled back; core ISL hooks remain active.");
         }
     }
 
@@ -4773,29 +4857,24 @@ static bool install_universal_point_light_hooks(const ModuleInfo& info)
         }
     }
     if (!pushVerified || !processVerified || !createVerified || !effects11Verified) {
-        if (effects11Patched) {
-            for (u32 i = 0u; i < effects11CallsiteCount; ++i) {
-                u8 originalCall[5] = {};
-                originalCall[0] = 0xE8u;
-                i32 originalDisp = 0;
-                if (rel32_displacement(effects11Callsites[i] + 5u, effects11Target, originalDisp)) {
-                    write_u32(originalCall + 1u, static_cast<u32>(originalDisp));
-                    write_code_bytes(effects11Callsites[i], originalCall, 5u);
-                }
-            }
-            g_originalEffects11OverridePointLightColor = nullptr;
+        if (effects11MayReferenceRelay) {
+            effects11MayReferenceRelay = !restore_effects11_calls(
+                effects11Callsites, effects11CallsiteCount, effects11Target);
+            if (!effects11MayReferenceRelay) g_originalEffects11OverridePointLightColor = nullptr;
             g_effects11AuthorityInstalled = false;
         }
-        const bool createRestored = !createPatched ||
-            write_code_bytes(createTarget, kExpectedCreatePrologue, kCreatePointLightOverwriteSize);
-        const bool processRestored = !processPatched ||
-            write_code_bytes(processTarget, kExpectedProcessPrologue, kProcessOverwriteSize);
+        const bool createRestored = !classifierSupported ||
+            restore_code_bytes(createTarget, kExpectedCreatePrologue, kCreatePointLightOverwriteSize);
+        const bool processRestored = !classifierSupported ||
+            restore_code_bytes(processTarget, kExpectedProcessPrologue, kProcessOverwriteSize);
         const bool pushRestored = !pushPatched ||
-            write_code_bytes(pushTarget, kExpectedPushPrologue, kPushOverwriteSize);
+            restore_code_bytes(pushTarget, kExpectedPushPrologue, kPushOverwriteSize);
         if (createRestored) g_originalCreatePointLight = nullptr;
         if (processRestored) g_originalProcessLight = nullptr;
         if (pushRestored) g_originalPushLight = nullptr;
-        if (createRestored && processRestored && pushRestored) VirtualFree(relayPage, 0u, MEM_RELEASE_);
+        if (createRestored && processRestored && pushRestored && !effects11MayReferenceRelay) {
+            VirtualFree(relayPage, 0u, MEM_RELEASE_);
+        }
         log_error("Renderer hook verification failed; installed hooks were rolled back where possible.");
         return false;
     }
@@ -4922,12 +5001,12 @@ DLLEXPORT bool SKSEPlugin_Query(const SKSEInterface* skse, PluginInfo* info)
 
     info->infoVersion = 1u;
     info->name = kPluginName;
-    info->version = 125u;
+    info->version = 126u;
 
     load_debug_setting();
     if (g_loggingEnabled) {
         ensure_log(false);
-        log_line("=== Global Point Light ISL 1.5-test22 ===");
+        log_line("=== Global Point Light ISL 1.5-test22.1 ===");
     }
 
     if (skse->isEditor != 0u) {

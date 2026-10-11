@@ -1,0 +1,34 @@
+Global Point Light ISL 1.5-test22.1
+Author: Aluwgren
+
+Maintenance prerelease for Skyrim SE 1.5.97, SKSE 2.0.20 and compatible
+Open Shaders (CommunityShaders.dll). Not for Anniversary Edition or VR.
+
+INSTALLATION
+
+MO2 or Vortex: install GlobalPointLightISL-1.5-test22.1.zip as a normal mod
+archive, enable it, and launch Skyrim through SKSE. The ZIP root is already
+the game's Data directory: SKSE/Plugins contains the DLL and INI. No FOMOD
+wizard, ESP, or additional plugin-list entry is required.
+
+Manual installation: extract the ZIP contents into Skyrim's Data directory.
+The resulting DLL path must be Data/SKSE/Plugins/GlobalPointLightISL.dll,
+not Data/Data/SKSE/Plugins/GlobalPointLightISL.dll.
+
+UPGRADING
+
+Replace the previous Global ISL mod rather than enabling two copies.
+Back up custom INI settings before replacing files. The bundled test22
+INI defaults are unchanged, so existing test22 settings remain applicable.
+
+VALIDATION STATUS
+
+This is a new LLVM 19 build with regression tests, static analysis, and
+binary/package checks. It has not been tested in Skyrim. Keep your tested
+test22 version available for rollback. No sun/moon lighting or FaceGen
+Shadow Softener changes are included.
+
+Source, changes, checksums, and matching source ZIP:
+https://github.com/Aluwgren/Global-ISL/releases/tag/v1.5-test22.1
+
+GPL v3; see LICENSE.txt in this directory.

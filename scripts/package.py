@@ -21,14 +21,14 @@ def main():
     if match is None:
         parser.error("could not read version from the source header")
     archive = build / f"GlobalPointLightISL-{match[1]}.zip"
-    plugins = build / "package/Data/SKSE/Plugins"
+    plugins = build / "package/SKSE/Plugins"
     verify(plugins / "GlobalPointLightISL.dll")
     # Enumerate only release files; never include arbitrary build directory contents.
     files = {
-        "Data/SKSE/Plugins/GlobalPointLightISL.dll": plugins / "GlobalPointLightISL.dll",
-        "Data/SKSE/Plugins/GlobalPointLightISL.ini": plugins / "GlobalPointLightISL.ini",
-        "LICENSE": root / "LICENSE",
-        "README.md": root / "README.md",
+        "SKSE/Plugins/GlobalPointLightISL.dll": plugins / "GlobalPointLightISL.dll",
+        "SKSE/Plugins/GlobalPointLightISL.ini": plugins / "GlobalPointLightISL.ini",
+        "docs/GlobalPointLightISL/LICENSE.txt": root / "LICENSE",
+        "docs/GlobalPointLightISL/README.txt": root / "docs/INSTALL.txt",
     }
     payloads = {name: path.read_bytes() for name, path in files.items()}
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as output:

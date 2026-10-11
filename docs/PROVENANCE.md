@@ -2,9 +2,11 @@
 
 Imported from the author-supplied `Global_ISL_1.5-test22_Astra_Codex_Review_Package.zip` on October 11, 2026.
 
-`GlobalPointLightISL.cpp`, `GlobalPointLightISL.ini`, and `kernel32.def` are byte-for-byte copies of the source archive. The GPL v3 license was also copied from that archive, as explicitly requested by the author. Historical Markdown documents are preserved under `docs/history/`.
+At import commit `37826c1`, `GlobalPointLightISL.cpp`, `GlobalPointLightISL.ini`, and `kernel32.def` were byte-for-byte copies of the source archive. The GPL v3 license was also copied from that archive, as explicitly requested by the author. Historical Markdown documents are preserved under `docs/history/`.
 
 Build intermediates, duplicate source copies under `build/`, and precompiled DLLs are excluded from Git. Build/verification/packaging scripts and GitHub documentation were prepared for this repository. The uploaded release remains the historical reference binary; a new compiler's output must not be described as that exact binary without a successful comparison.
+
+The maintenance prerelease `1.5-test22.1` modifies the C++ source as documented in [REVIEW.md](REVIEW.md). The INI, import definition, and GPL license remain exact copies of the supplied files. The hashes below describe the original import, not the revised DLL.
 
 ## Verified hashes
 

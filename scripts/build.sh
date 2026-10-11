@@ -31,7 +31,7 @@ cp "$ROOT/GlobalPointLightISL.cpp" "$ROOT/kernel32.def" "$STAGE/"
 )
 
 "$ROOT/scripts/verify_pe.sh" "$STAGE/GlobalPointLightISL.dll"
-mkdir -p "$BUILD/package/Data/SKSE/Plugins"
+mkdir -p "$BUILD/package/SKSE/Plugins"
 cp "$STAGE/GlobalPointLightISL.dll" "$BUILD/GlobalPointLightISL.dll"
-cp "$STAGE/GlobalPointLightISL.dll" "$ROOT/GlobalPointLightISL.ini" "$BUILD/package/Data/SKSE/Plugins/"
+cp "$STAGE/GlobalPointLightISL.dll" "$ROOT/GlobalPointLightISL.ini" "$BUILD/package/SKSE/Plugins/"
 echo "Built and verified: $BUILD/GlobalPointLightISL.dll"

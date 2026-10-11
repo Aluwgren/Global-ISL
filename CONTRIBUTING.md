@@ -4,7 +4,7 @@ Use the existing checkout and make focused changes against the test22 baseline. 
 
 Before opening a pull request:
 
-1. Run `./scripts/package.sh` and confirm the PE verification passes.
+1. Run `./scripts/check.sh` for native regressions, static analysis, the Windows cross-build, PE checks, packaging, and reproducibility.
 2. Describe the behavior changed, the reason, and the checks performed.
 3. Clearly separate build/static checks from in-game observations. Include the Skyrim, SKSE, and Open Shaders versions for runtime tests.
 4. Keep generated DLLs, object files, ZIPs, and logs out of commits.
